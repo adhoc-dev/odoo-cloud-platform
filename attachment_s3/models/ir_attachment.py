@@ -7,6 +7,7 @@ import logging
 import os
 import io
 from urllib.parse import urlsplit
+from ast import literal_eval
 
 from odoo import _, api, exceptions, models
 from ..s3uri import S3Uri
@@ -142,6 +143,12 @@ class IrAttachment(models.Model):
     @api.model
     def _store_file_write(self, key, bin_data):
         location = self.env.context.get('storage_location') or self._storage()
+        metadata_dbname = literal_eval(
+            self.env['ir.config_parameter'].sudo().get_param(
+                'attachment_s3.store_db_name_as_metadata', 'False'))
+        metadata_force_ownership = literal_eval(
+            self.env['ir.config_parameter'].sudo().get_param(
+                'attachment_s3.force_ownership_as_metadata', 'False'))
         if location == 's3':
             bucket = self._get_s3_bucket()
             obj = bucket.Object(key=key)
@@ -149,8 +156,19 @@ class IrAttachment(models.Model):
                 file.write(bin_data)
                 file.seek(0)
                 filename = 's3://%s/%s' % (bucket.name, key)
+                extra_args = {}
+                if metadata_dbname:
+                    database_name = self.env.cr.dbname
+                    if not metadata_force_ownership:
+                        try:
+                            database_name = obj.metadata.get(
+                                'database_name', self.env.cr.dbname)
+                        except ClientError as error:
+                            pass
+                    extra_args['Metadata'] = {
+                        'database_name': database_name}
                 try:
-                    obj.upload_fileobj(file)
+                    obj.upload_fileobj(file, ExtraArgs=extra_args)
                 except ClientError as error:
                     # log verbose error from s3, return short message for user
                     _logger.exception(
@@ -176,13 +194,13 @@ class IrAttachment(models.Model):
                 bucket = self._get_s3_bucket()
                 obj = bucket.Object(key=item_name)
                 try:
-                    bucket.meta.client.head_object(
-                        Bucket=bucket.name, Key=item_name
-                    )
-                    obj.delete()
-                    _logger.info(
-                        'file %s deleted on the object storage' % (fname,)
-                    )
+                    db_metadata = bucket.meta.client.head_object(
+                        Bucket=bucket.name, Key=item_name)['Metadata'].get(
+                            'database_name', False)
+                    if not db_metadata or db_metadata == self.env.cr.dbname:
+                        obj.delete()
+                        _logger.info(
+                            'file %s deleted on the object storage' % fname)
                 except ClientError:
                     # log verbose error from s3, return short message for
                     # user
