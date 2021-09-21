@@ -8,8 +8,9 @@ import os
 import io
 from urllib.parse import urlsplit
 from ast import literal_eval
+from datetime import timedelta
 
-from odoo import _, api, exceptions, models
+from odoo import _, api, exceptions, models, fields
 from ..s3uri import S3Uri
 
 _logger = logging.getLogger(__name__)
@@ -26,6 +27,8 @@ except ImportError:
 
 class IrAttachment(models.Model):
     _inherit = "ir.attachment"
+
+    to_delete = fields.Boolean(readonly=True)
 
     def _get_stores(self):
         l = ['s3']
@@ -185,6 +188,8 @@ class IrAttachment(models.Model):
     @api.model
     def _store_file_delete(self, fname):
         if fname.startswith('s3://'):
+            if self.env.context.get('skip_s3_object_deletion'):
+                return
             s3uri = S3Uri(fname)
             bucket_name = s3uri.bucket()
             item_name = s3uri.item()
@@ -209,3 +214,26 @@ class IrAttachment(models.Model):
                     )
         else:
             super()._store_file_delete(fname)
+
+    def unlink(self):
+        for attachment in self:
+            if (not attachment.to_delete
+                    and attachment.store_fname.startswith('s3://')
+                    and int(self.env['ir.config_parameter'].sudo().get_param(
+                        'attachment_s3.retention_days', '0'))):
+                self.copy(default={'to_delete': True})
+                return super(
+                    IrAttachment, self.with_context(
+                        skip_s3_object_deletion=True)).unlink()
+            return super(IrAttachment, self).unlink()
+
+    @api.model
+    def _delete_old_attachment_s3(self):
+        retention_days = int(self.env['ir.config_parameter'].sudo(
+        ).get_param('attachment_s3.retention_days', '0'))
+        if not retention_days:
+            return
+        limit = fields.Datetime.now() - timedelta(days=retention_days)
+        attachments = self.search([('to_delete', '=', 'True'),
+                                   ('create_date', '<', limit)])
+        attachments.unlink()
